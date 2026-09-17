@@ -81,8 +81,26 @@ test('categoryLabel reuses chip i18n and falls back to the tool name', () => {
   assert.equal(categoryLabel('user', t), 'User')
   assert.equal(categoryLabel('assistant', t), 'Assistant')
   assert.equal(categoryLabel('injected', t), 'injected')
+  assert.equal(categoryLabel('system', t), 'System')
   assert.equal(categoryLabel('tool:bash', t), 'bash')
   assert.equal(categoryLabel('tool:', t), 'Tool')
+})
+
+test('deletable locks only the system prompt', () => {
+  const { deletable } = plugin.__internals
+  assert.equal(deletable({ kind: 'system' }), false)
+  assert.equal(deletable({ kind: 'user' }), true)
+  assert.equal(deletable({ kind: 'assistant' }), true)
+  assert.equal(deletable({ kind: 'tool', tool: 'Read' }), true)
+  assert.equal(deletable(undefined), false)
+})
+
+test('system entries get a chip label and a locked reason', () => {
+  const { entryChip, entryCategory, ZH } = plugin.__internals
+  const t = (key, vars) => { let out = ZH[key] ?? key; if (vars) for (const [k, v] of Object.entries(vars)) out = out.split('{' + k + '}').join(String(v)); return out }
+  assert.equal(entryChip({ kind: 'system' }, t).label, '系统')
+  assert.equal(entryCategory({ kind: 'system' }), 'system')
+  assert.ok(ZH.systemLockedHint.includes('系统提示词'))
 })
 
 test('pctOf formats share-of-context and tolerates empty totals', () => {

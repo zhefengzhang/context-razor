@@ -69,6 +69,8 @@ const ZH = {
   kindInjected: '注入',
   kindAssistant: '助手',
   kindTool: '工具',
+  kindSystem: '系统',
+  systemLockedHint: '系统提示词不可删除：宿主只允许它被另一条 system/message 覆写，而本插件的删除是以标记消息替换整段。',
   emptyContext: '该会话上下文为空',
   showMore: '显示更多（剩余 {n}）',
   detailTitle: '条目详情',
@@ -111,6 +113,8 @@ const EN = {
   kindInjected: 'injected',
   kindAssistant: 'Assistant',
   kindTool: 'Tool',
+  kindSystem: 'System',
+  systemLockedHint: 'The system prompt cannot be deleted: the host allows it to be rewritten only by another system/message, while this plugin replaces a range with a marker message.',
   emptyContext: 'This session has no context entries',
   showMore: 'Show more ({n} left)',
   detailTitle: 'Entry detail',
@@ -185,10 +189,21 @@ function entryCategory(entry) {
   if (entry.kind === 'user' && entry.sourceKind && entry.sourceKind !== 'user') return 'injected'
   return entry.kind
 }
+/**
+ * 该条目能否被剃刀删除。
+ *
+ * 系统提示词（surface node 0 的 system/message）不行：宿主只允许它被另一条
+ * `system/message` 单节点覆写，而剃刀的删除是以 user/message 标记替换整段。
+ * 宿主侧的护栏在 `deleteEntries` 里，这里只是别让 UI 给出一条注定失败的路。
+ */
+function deletable(entry) {
+  return !!entry && entry.kind !== 'system'
+}
 function categoryLabel(cat, t) {
   if (cat === 'user') return t('kindUser')
   if (cat === 'assistant') return t('kindAssistant')
   if (cat === 'injected') return t('kindInjected')
+  if (cat === 'system') return t('kindSystem')
   if (cat.lastIndexOf('tool:', 0) === 0) {
     const name = cat.slice(5)
     return name || t('kindTool')
@@ -270,6 +285,8 @@ const STYLE = `<style>
 .rz-row{display:flex;gap:10px;align-items:center;padding:8px 12px;border-radius:10px;border:1px solid var(--dsw-alias-border-l1);border-left:3px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-layer-1);cursor:pointer;text-align:left;width:100%}
 .rz-row:hover{background:var(--dsw-alias-interactive-bg-hover)}
 .rz-row.checked{border-color:var(--dsw-alias-state-business-primary)}
+.rz-row.locked{cursor:default;opacity:.75}
+.rz-row.locked:hover{background:var(--dsw-alias-bg-layer-1)}
 .rz-row-preview{flex:0 1 340px;min-width:100px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--dsw-alias-label-primary);font-size:13px;text-decoration:none}
 .rz-row-preview:hover{text-decoration:underline;text-underline-offset:3px}
 .rz-row-meta{color:var(--dsw-alias-label-tertiary);font-size:11px;flex:none}
@@ -430,12 +447,16 @@ function RazorPage({ t, fixedSessionId }) {
   const selectedTokens = useMemo(() => sumSeqs(selected), [selected, entriesBySeq])
   const confirmTokens = useMemo(() => confirming ? sumSeqs(confirming) : 0, [confirming, entriesBySeq])
 
-  const toggleRow = (seq) => setSelected(prev => {
-    const next = new Set(prev)
-    if (next.has(seq)) next.delete(seq)
-    else next.add(seq)
-    return next
-  })
+  const toggleRow = (seq) => {
+    const entry = entriesBySeq && entriesBySeq.get(seq)
+    if (entry && !deletable(entry)) return   // 系统提示词不可删，勾也没用
+    setSelected(prev => {
+      const next = new Set(prev)
+      if (next.has(seq)) next.delete(seq)
+      else next.add(seq)
+      return next
+    })
+  }
   const toggleTier = (i) => setTierFilter(prev => {
     const next = new Set(prev)
     if (next.has(i)) next.delete(i)
@@ -448,7 +469,7 @@ function RazorPage({ t, fixedSessionId }) {
     else next.add(cat)
     return next
   })
-  const selectVisible = () => setSelected(new Set(visible.map(e => e.seq)))
+  const selectVisible = () => setSelected(new Set(visible.filter(deletable).map(e => e.seq)))
 
   const openDetail = (entry) => {
     setDetail(entry)
@@ -523,20 +544,24 @@ function RazorPage({ t, fixedSessionId }) {
             h(PagedList, { items: visible, t, render: entry => {
               const tier = tierOf(entry)
               const pct = pctOf(entry.tokens, context.totalTokens)
-              return h('div', { key: entry.seq, className: 'rz-row tier-' + tier + (selected.has(entry.seq) ? ' checked' : ''),
-                  role: 'button', tabIndex: 0, onClick: () => toggleRow(entry.seq),
+              const locked = !deletable(entry)
+              const lockedTitle = locked ? t('systemLockedHint') : ''
+              return h('div', { key: entry.seq, className: 'rz-row tier-' + tier + (selected.has(entry.seq) ? ' checked' : '') + (locked ? ' locked' : ''),
+                  role: 'button', tabIndex: 0, title: lockedTitle || undefined,
+                  onClick: () => toggleRow(entry.seq),
                   onKeyDown: e => e.key === 'Enter' && toggleRow(entry.seq) },
-                h('input', { type: 'checkbox', checked: selected.has(entry.seq), onClick: e => e.stopPropagation(), onChange: () => toggleRow(entry.seq) }),
+                h('input', { type: 'checkbox', checked: selected.has(entry.seq), disabled: locked, title: lockedTitle || undefined,
+                  onClick: e => e.stopPropagation(), onChange: () => toggleRow(entry.seq) }),
                 h('span', { className: 'rz-col-tok' }, h(TokenBadge, { entry })),
                 h('span', { className: 'rz-col-pct', title: pct ? pct + ' of ≈' + formatNum(context.totalTokens) + ' token' : '' }, pct || ''),
                 h(Chip, { ...entryChip(entry, t) }),
-                h('span', { className: 'rz-row-preview', title: entry.preview,
+                h('span', { className: 'rz-row-preview', title: locked ? lockedTitle : entry.preview,
                     onClick: e => { e.stopPropagation(); openDetail(entry) } }, entry.preview || ' '),
                 h('span', { className: 'rz-row-meta', title: 'seq ' + entry.seq }, formatDateTime(entry.time)),
-                h('button', { className: 'rz-row-del', type: 'button', disabled: busy,
-                    title: busy ? t('deleteBusyHint') : t('deleteOneHint', { tokens: formatNum(entry.tokens) }),
+                h('button', { className: 'rz-row-del', type: 'button', disabled: busy || locked,
+                    title: locked ? lockedTitle : (busy ? t('deleteBusyHint') : t('deleteOneHint', { tokens: formatNum(entry.tokens) })),
                     'aria-label': t('deleteOne'),
-                    onClick: e => { e.stopPropagation(); if (!busy) setConfirming([entry.seq]) } }, '✕'))
+                    onClick: e => { e.stopPropagation(); if (!busy && !locked) setConfirming([entry.seq]) } }, '✕'))
             } })),
       detail && h(DetailModal, { detail, t, total: context.totalTokens, onClose: () => setDetail(null) }),
       confirming && confirming.length > 0 && h(ConfirmDialog, { n: confirming.length, tokens: formatNum(confirmTokens), deleting, t,
@@ -552,7 +577,7 @@ const CLIENT_NAME = '@weibaohui/context-razor'
 module.exports = {
   name: CLIENT_NAME,
   inject: ['slots', 'locale'],
-  __internals: { NS, ZH, EN, sortEntries, tierOf, RAZOR_TIERS, formatDateTime, entryChip, entryCategory, categoryLabel, pctOf },
+  __internals: { NS, ZH, EN, sortEntries, tierOf, RAZOR_TIERS, formatDateTime, entryChip, entryCategory, categoryLabel, pctOf, deletable },
   __boot(container, opts = {}) {
     ensureStyles()
     const t = opts.t || ((key, vars) => {

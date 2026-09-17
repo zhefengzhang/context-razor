@@ -18,7 +18,7 @@ window.__ModuleLoader__.load({
      * (hsl computed per bucket). No class components — render errors land in
      * globalThis.__rzErrors.
      */
-
+    
     let __React = null
     try { __React = require('react') } catch {}
     if (!__React || typeof __React.createElement !== 'function') {
@@ -31,10 +31,10 @@ window.__ModuleLoader__.load({
       }
     }
     const { createElement: h, useState, useEffect, useMemo, useRef } = __React
-
+    
     let P = null
     try { P = require('@deepseek-ai/dsh-client-ui-primitives') } catch {}
-
+    
     /** Idempotent stylesheet injection (position-critical classes included). */
     function ensureStyles() {
       if (typeof document === 'undefined' || document.getElementById('rz-styles')) return
@@ -44,18 +44,18 @@ window.__ModuleLoader__.load({
       holder.innerHTML = STYLE
       document.head.appendChild(holder)
     }
-
+    
     const prim = (name) => P && P[name]
       ? P[name]
       : function Shim(props) {
           const { children, ...rest } = props
           return h('button', { ...rest, 'data-p-shim': name }, children)
         }
-
+    
     // ── Locale ───────────────────────────────────────────────────────────────
-
+    
     const NS = 'contextRazor'
-
+    
     const ZH = {
       title: '上下文剃刀',
       pickSession: '在会话顶部标签打开以查看上下文',
@@ -79,6 +79,8 @@ window.__ModuleLoader__.load({
       kindInjected: '注入',
       kindAssistant: '助手',
       kindTool: '工具',
+      kindSystem: '系统',
+      systemLockedHint: '系统提示词不可删除：宿主只允许它被另一条 system/message 覆写，而本插件的删除是以标记消息替换整段。',
       emptyContext: '该会话上下文为空',
       showMore: '显示更多（剩余 {n}）',
       detailTitle: '条目详情',
@@ -97,7 +99,7 @@ window.__ModuleLoader__.load({
       operationFailed: '操作失败',
       seqLabel: 'seq {seq}',
     }
-
+    
     const EN = {
       title: 'Context Razor',
       pickSession: 'Open a conversation tab to inspect its context',
@@ -121,6 +123,8 @@ window.__ModuleLoader__.load({
       kindInjected: 'injected',
       kindAssistant: 'Assistant',
       kindTool: 'Tool',
+      kindSystem: 'System',
+      systemLockedHint: 'The system prompt cannot be deleted: the host allows it to be rewritten only by another system/message, while this plugin replaces a range with a marker message.',
       emptyContext: 'This session has no context entries',
       showMore: 'Show more ({n} left)',
       detailTitle: 'Entry detail',
@@ -139,14 +143,14 @@ window.__ModuleLoader__.load({
       operationFailed: 'Operation failed',
       seqLabel: 'seq {seq}',
     }
-
+    
     // ── Pure helpers ────────────────────────────────────────────────────────
-
+    
     const API = '/context-razor/api'
     const PAGE_SIZE = 150
-
+    
     const kindI18n = (key) => 'kind' + key[0].toUpperCase() + key.slice(1)
-
+    
     /** 排序：order = 投影原序（模型可见序）；tokens = 降序（并列按 seq，缺 token 沉底）。
      *  只有两档且都是显示层——裁剪过的会话里 seq 升序 ≠ 模型可见序（replace 标记 seq 大但位置在中间），
      *  与「本页展示模型可见上下文」相悖，故不提供 seq 档。 */
@@ -160,9 +164,9 @@ window.__ModuleLoader__.load({
         return vb - va
       })
     }
-
+    
     const formatNum = (n) => Number.isFinite(n) ? n.toLocaleString('en-US') : '-'
-
+    
     /** 完整日期时间（短格式：2026/9/2 11:03；ts 兼容 epoch 毫秒与 ISO 串）。 */
     function formatDateTime(ts) {
       if (!ts) return ''
@@ -170,7 +174,7 @@ window.__ModuleLoader__.load({
       if (!Number.isFinite(t)) return ''
       try { return new Date(t).toLocaleString([], { dateStyle: 'short', timeStyle: 'short' }) } catch { return new Date(t).toLocaleString() }
     }
-
+    
     /** 行首 chip 的文案与提示：工具结果显示工具名，注入类 user 消息标「注入」。 */
     function entryChip(entry, t) {
       if (entry.kind === 'tool') {
@@ -181,7 +185,7 @@ window.__ModuleLoader__.load({
       }
       return { kind: entry.kind, label: t(kindI18n(entry.kind)) }
     }
-
+    
     /**
      * 筛选用稳定分类键，与 entryChip 的可见口径一致：
      *   tool  → 'tool:<工具名>'（无工具名则 'tool:'，按钮文案退回「工具」）
@@ -195,17 +199,28 @@ window.__ModuleLoader__.load({
       if (entry.kind === 'user' && entry.sourceKind && entry.sourceKind !== 'user') return 'injected'
       return entry.kind
     }
+    /**
+     * 该条目能否被剃刀删除。
+     *
+     * 系统提示词（surface node 0 的 system/message）不行：宿主只允许它被另一条
+     * `system/message` 单节点覆写，而剃刀的删除是以 user/message 标记替换整段。
+     * 宿主侧的护栏在 `deleteEntries` 里，这里只是别让 UI 给出一条注定失败的路。
+     */
+    function deletable(entry) {
+      return !!entry && entry.kind !== 'system'
+    }
     function categoryLabel(cat, t) {
       if (cat === 'user') return t('kindUser')
       if (cat === 'assistant') return t('kindAssistant')
       if (cat === 'injected') return t('kindInjected')
+      if (cat === 'system') return t('kindSystem')
       if (cat.lastIndexOf('tool:', 0) === 0) {
         const name = cat.slice(5)
         return name || t('kindTool')
       }
       return cat
     }
-
+    
     /** 该条 token 占全部上下文的百分比文案；total 非正或 part 为 0 返回 null（不显示）。 */
     function pctOf(part, total) {
       if (!total || !part) return null
@@ -213,7 +228,7 @@ window.__ModuleLoader__.load({
       if (p < 0.1) return '<0.1%'
       return (p >= 10 ? p.toFixed(0) : p.toFixed(1)) + '%'
     }
-
+    
     // ── 彩虹分级：颜色越暖 = 占用越多 ────────────────────────────────────────
     // 固定对数档位（相邻约 ×2.5），跨会话语义稳定：绿→黄绿→黄→橙→红→品红。
     // 档位是「这条消息吃掉多少典型上下文预算」的粗标尺，不随会话内最大值缩放。
@@ -229,7 +244,7 @@ window.__ModuleLoader__.load({
       const tokens = typeof entry.tokens === 'number' ? entry.tokens : 0
       return RAZOR_TIERS.findIndex(t => tokens <= t.max)
     }
-
+    
     async function getJson(url) {
       const r = await fetch(url)
       if (!r.ok) {
@@ -238,9 +253,9 @@ window.__ModuleLoader__.load({
       }
       return r.json()
     }
-
+    
     // ── Token-based stylesheet (light/dark adaptive by construction) ────────
-
+    
     const STYLE = `<style>
     .rz-page,.rz-page *{box-sizing:border-box}
     .rz-page{position:relative;display:flex;flex-direction:column;gap:12px;padding:16px 20px;min-width:0;color:var(--dsw-alias-label-primary);font-family:var(--dsw-font-family);font-size:var(--dsw-font-sm-14,14px)}
@@ -280,6 +295,8 @@ window.__ModuleLoader__.load({
     .rz-row{display:flex;gap:10px;align-items:center;padding:8px 12px;border-radius:10px;border:1px solid var(--dsw-alias-border-l1);border-left:3px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-layer-1);cursor:pointer;text-align:left;width:100%}
     .rz-row:hover{background:var(--dsw-alias-interactive-bg-hover)}
     .rz-row.checked{border-color:var(--dsw-alias-state-business-primary)}
+    .rz-row.locked{cursor:default;opacity:.75}
+    .rz-row.locked:hover{background:var(--dsw-alias-bg-layer-1)}
     .rz-row-preview{flex:0 1 340px;min-width:100px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--dsw-alias-label-primary);font-size:13px;text-decoration:none}
     .rz-row-preview:hover{text-decoration:underline;text-underline-offset:3px}
     .rz-row-meta{color:var(--dsw-alias-label-tertiary);font-size:11px;flex:none}
@@ -313,17 +330,17 @@ window.__ModuleLoader__.load({
     .rz-dlg-text{white-space:pre-wrap;font-size:12.5px;line-height:1.55;border:1px solid var(--dsw-alias-border-l1);border-radius:10px;background:var(--dsw-alias-bg-layer-1);padding:12px;max-height:46vh;overflow:auto}
     .rz-toast{position:fixed;left:50%;bottom:28px;transform:translateX(-50%);z-index:40;background:var(--dsw-alias-bg-layer-3);color:var(--dsw-alias-label-primary);border:1px solid var(--dsw-alias-border-l2);border-radius:999px;padding:8px 18px;font-size:13px;box-shadow:var(--dsw-shadow-lv2)}
     </style>`
-
+    
     // ── Small building blocks ────────────────────────────────────────────────
-
+    
     const Chip = ({ kind, label, title }) => h('span', { className: 'rz-chip ' + kind, title }, label)
-
+    
     const TokenBadge = ({ entry }) => {
       const tier = tierOf(entry)
       return h('span', { className: 'rz-badge tier-' + tier, title: RAZOR_TIERS[tier].label + ' token' },
         '≈' + formatNum(entry.tokens))
     }
-
+    
     /** 分页列表：先渲染 pageSize 行，按需增长（大会话一次挂几千行会卡）。 */
     function PagedList({ items, render, t }) {
       const [shown, setShown] = useState(PAGE_SIZE)
@@ -334,7 +351,7 @@ window.__ModuleLoader__.load({
           h('button', { className: 'rz-btn', onClick: () => setShown(n => n + PAGE_SIZE) }, t('showMore', { n: items.length - shown }))),
       ]
     }
-
+    
     /** 单条全文弹窗（正文经 /entry 异步补全）。 */
     function DetailModal({ detail, t, total, onClose }) {
       if (!detail) return null
@@ -355,7 +372,7 @@ window.__ModuleLoader__.load({
           h('div', { className: 'rz-dlg-foot' },
             h('button', { className: 'rz-btn', onClick: onClose }, t('close')))))
     }
-
+    
     /** 裁剪确认弹窗。 */
     function ConfirmDialog({ n, tokens, deleting, t, onCancel, onOk }) {
       return h('div', { className: 'rz-dlg-backdrop', onClick: onCancel },
@@ -366,9 +383,9 @@ window.__ModuleLoader__.load({
             h('button', { className: 'rz-btn', onClick: onCancel }, t('cancel')),
             h('button', { className: 'rz-btn rz-btn-danger', disabled: deleting, onClick: onOk }, t('deleteOk')))))
     }
-
+    
     // ── Page ────────────────────────────────────────────────────────────────
-
+    
     function RazorPage({ t, fixedSessionId }) {
       useEffect(ensureStyles, [])
       const [sessionId, setSessionId] = useState('')
@@ -384,14 +401,14 @@ window.__ModuleLoader__.load({
       const [deleting, setDeleting] = useState(false)
       const [toast, setToast] = useState(null)
       const sessionRef = useRef('')
-
+    
       const showToast = (text) => { setToast(text); setTimeout(() => setToast(null), 3000) }
-
+    
       // 会话视图挂载：只管当前会话（fixedSessionId 来自 slot props）
       useEffect(() => {
         if (fixedSessionId) { sessionRef.current = fixedSessionId; setSessionId(fixedSessionId) }
       }, [fixedSessionId])
-
+    
       const loadContext = (id) => {
         if (!id) { setContext(null); return }
         setCtxLoading(true)
@@ -402,11 +419,11 @@ window.__ModuleLoader__.load({
           .finally(() => setCtxLoading(false))
       }
       useEffect(() => { if (sessionId) loadContext(sessionId) }, [sessionId])
-
+    
       const refreshAll = () => {
         if (sessionRef.current) loadContext(sessionRef.current)
       }
-
+    
       const visible = useMemo(() => {
         if (!context) return []
         let rows = context.entries
@@ -414,7 +431,7 @@ window.__ModuleLoader__.load({
         if (kindFilter.size > 0) rows = rows.filter(e => kindFilter.has(entryCategory(e)))
         return sortEntries(rows, sortBy)
       }, [context, tierFilter, kindFilter, sortBy])
-
+    
       // 当前上下文里实际出现的分类（cat/count/tokens），按条数降序——决定渲染哪些按钮。
       const categories = useMemo(() => {
         if (!context) return []
@@ -430,7 +447,7 @@ window.__ModuleLoader__.load({
           .map(([cat, v]) => ({ cat, count: v.count, tokens: v.tokens }))
           .sort((a, b) => b.count - a.count || b.tokens - a.tokens)
       }, [context])
-
+    
       const entriesBySeq = useMemo(() => context ? new Map(context.entries.map(e => [e.seq, e])) : null, [context])
       const sumSeqs = (seqs) => {
         let sum = 0
@@ -439,13 +456,17 @@ window.__ModuleLoader__.load({
       }
       const selectedTokens = useMemo(() => sumSeqs(selected), [selected, entriesBySeq])
       const confirmTokens = useMemo(() => confirming ? sumSeqs(confirming) : 0, [confirming, entriesBySeq])
-
-      const toggleRow = (seq) => setSelected(prev => {
-        const next = new Set(prev)
-        if (next.has(seq)) next.delete(seq)
-        else next.add(seq)
-        return next
-      })
+    
+      const toggleRow = (seq) => {
+        const entry = entriesBySeq && entriesBySeq.get(seq)
+        if (entry && !deletable(entry)) return   // 系统提示词不可删，勾也没用
+        setSelected(prev => {
+          const next = new Set(prev)
+          if (next.has(seq)) next.delete(seq)
+          else next.add(seq)
+          return next
+        })
+      }
       const toggleTier = (i) => setTierFilter(prev => {
         const next = new Set(prev)
         if (next.has(i)) next.delete(i)
@@ -458,15 +479,15 @@ window.__ModuleLoader__.load({
         else next.add(cat)
         return next
       })
-      const selectVisible = () => setSelected(new Set(visible.map(e => e.seq)))
-
+      const selectVisible = () => setSelected(new Set(visible.filter(deletable).map(e => e.seq)))
+    
       const openDetail = (entry) => {
         setDetail(entry)
         getJson(`${API}/entry?session=${encodeURIComponent(sessionId)}&seq=${entry.seq}`)
           .then(d => setDetail(cur => (cur && cur.seq === entry.seq) ? { ...cur, text: d.text, tokens: d.tokens, tool: d.tool, sourceKind: d.sourceKind, sourceForm: d.sourceForm, sourcePlugin: d.sourcePlugin } : cur))
           .catch(() => {})
       }
-
+    
       const doDelete = async () => {
         if (!confirming || confirming.length === 0) return
         setDeleting(true)
@@ -483,10 +504,10 @@ window.__ModuleLoader__.load({
           setError(e.message)
         } finally { setDeleting(false) }
       }
-
+    
       const busy = !!(context && context.busy)
       const canDelete = selected.size > 0 && !busy && !deleting
-
+    
       return h('div', { className: 'rz-page' },
         error && h('div', { className: 'rz-hint', style: { color: 'var(--dsw-alias-state-error-primary)' } }, t('operationFailed') + ': ' + error),
         !sessionId && h('div', { className: 'rz-empty' }, t('pickSession')),
@@ -533,20 +554,24 @@ window.__ModuleLoader__.load({
                 h(PagedList, { items: visible, t, render: entry => {
                   const tier = tierOf(entry)
                   const pct = pctOf(entry.tokens, context.totalTokens)
-                  return h('div', { key: entry.seq, className: 'rz-row tier-' + tier + (selected.has(entry.seq) ? ' checked' : ''),
-                      role: 'button', tabIndex: 0, onClick: () => toggleRow(entry.seq),
+                  const locked = !deletable(entry)
+                  const lockedTitle = locked ? t('systemLockedHint') : ''
+                  return h('div', { key: entry.seq, className: 'rz-row tier-' + tier + (selected.has(entry.seq) ? ' checked' : '') + (locked ? ' locked' : ''),
+                      role: 'button', tabIndex: 0, title: lockedTitle || undefined,
+                      onClick: () => toggleRow(entry.seq),
                       onKeyDown: e => e.key === 'Enter' && toggleRow(entry.seq) },
-                    h('input', { type: 'checkbox', checked: selected.has(entry.seq), onClick: e => e.stopPropagation(), onChange: () => toggleRow(entry.seq) }),
+                    h('input', { type: 'checkbox', checked: selected.has(entry.seq), disabled: locked, title: lockedTitle || undefined,
+                      onClick: e => e.stopPropagation(), onChange: () => toggleRow(entry.seq) }),
                     h('span', { className: 'rz-col-tok' }, h(TokenBadge, { entry })),
                     h('span', { className: 'rz-col-pct', title: pct ? pct + ' of ≈' + formatNum(context.totalTokens) + ' token' : '' }, pct || ''),
                     h(Chip, { ...entryChip(entry, t) }),
-                    h('span', { className: 'rz-row-preview', title: entry.preview,
+                    h('span', { className: 'rz-row-preview', title: locked ? lockedTitle : entry.preview,
                         onClick: e => { e.stopPropagation(); openDetail(entry) } }, entry.preview || ' '),
                     h('span', { className: 'rz-row-meta', title: 'seq ' + entry.seq }, formatDateTime(entry.time)),
-                    h('button', { className: 'rz-row-del', type: 'button', disabled: busy,
-                        title: busy ? t('deleteBusyHint') : t('deleteOneHint', { tokens: formatNum(entry.tokens) }),
+                    h('button', { className: 'rz-row-del', type: 'button', disabled: busy || locked,
+                        title: locked ? lockedTitle : (busy ? t('deleteBusyHint') : t('deleteOneHint', { tokens: formatNum(entry.tokens) })),
                         'aria-label': t('deleteOne'),
-                        onClick: e => { e.stopPropagation(); if (!busy) setConfirming([entry.seq]) } }, '✕'))
+                        onClick: e => { e.stopPropagation(); if (!busy && !locked) setConfirming([entry.seq]) } }, '✕'))
                 } })),
           detail && h(DetailModal, { detail, t, total: context.totalTokens, onClose: () => setDetail(null) }),
           confirming && confirming.length > 0 && h(ConfirmDialog, { n: confirming.length, tokens: formatNum(confirmTokens), deleting, t,
@@ -554,15 +579,15 @@ window.__ModuleLoader__.load({
         ],
         toast && h('div', { className: 'rz-toast' }, toast))
     }
-
+    
     // ── Plugin plane contract ────────────────────────────────────────────────
-
+    
     const CLIENT_NAME = '@weibaohui/context-razor'
-
+    
     module.exports = {
       name: CLIENT_NAME,
       inject: ['slots', 'locale'],
-      __internals: { NS, ZH, EN, sortEntries, tierOf, RAZOR_TIERS, formatDateTime, entryChip, entryCategory, categoryLabel, pctOf },
+      __internals: { NS, ZH, EN, sortEntries, tierOf, RAZOR_TIERS, formatDateTime, entryChip, entryCategory, categoryLabel, pctOf, deletable },
       __boot(container, opts = {}) {
         ensureStyles()
         const t = opts.t || ((key, vars) => {

@@ -5,10 +5,27 @@
  * 勾选后精确裁剪。删除不是物理删日志（append-only、深冻结、zstd 校验，
  * 宿主根本不支持），而是走宿主的 surface replace 协议——与官方
  * dsh-compaction-tool-result-pruner 同款：先追加一条 `compaction/prune`
- * 计价事件，再追加一条带 `surfaceOp: {op:'replace'}` 的标记 user/message，
- * `sourceEventSeqs` 覆盖全部被影子化的节点。被删节点从此不进
- * `deriveMessages()`（模型视野消失），web UI 也随 mux fold 同步折叠。
- * 全程不经 LLM 总结——删了什么、删了多少，用户逐条可见。
+ * 计价事件，再追加一条带 `surfaceOp: {op:'replace', startSeq, endSeq}`
+ * 的标记 user/message，`sourceEventSeqs` 覆盖全部被影子化的节点。被删节点
+ * 从此不进 `deriveMessages()`（模型视野消失），web UI 也随 mux fold 同步
+ * 折叠。全程不经 LLM 总结——删了什么、删了多少，用户逐条可见。
+ *
+ * 这份实现必须同时满足宿主的两条契约，缺一条就会静默出错：
+ *
+ * 1. **surfaceOp 形状**：replace 只接受恰好 `{ op, startSeq, endSeq }`
+ *    三个键（宿主 `isReplaceOp` + `validateSurfaceMetadata`）。字段名写成
+ *    `start`/`end` 会被拒：`carries an invalid replace surfaceOp`。
+ * 2. **工具配对**：一个 step 的 `tool-call` 与其 `tool/result` 不可拆开。
+ *    宿主把拆开后的状态判为损坏——折叠遇到"没有对应 tool-call 的
+ *    tool/result"会 throw（`… has no matching tool-call (corrupt surface)`），
+ *    压缩引擎的 `compactRegion` 也拒绝在不平衡切口下刀。判定用宿主自己
+ *    导出的 `toolPairingBalancedBefore/After`，不本地重写一份 fold。
+ * 3. **系统提示词**：surface node 0 是系统提示词时，宿主只允许它被另一条
+ *    `system/message` 覆盖（`assertSystemHeadRewrite`）。剃刀用 user/message
+ *    标记替换，所以系统提示词不可删——显式拦住，不留给宿主拒。
+ *
+ * 另外 `compaction/prune` 的 `shadowedTokenCount` 会被宿主的 surface 折叠
+ * 直接相减，所以必须用宿主计量器那一把尺子（见 `pricingFor`）。
  */
 
 const { randomUUID } = require('node:crypto')
@@ -50,8 +67,10 @@ function countTokens(text) {
 }
 
 // ── 事件 → 模型可见文本 ────────────────────────────────────────────────
-// surface 上只有三类事件（dsh-session SURFACE_EVENT_TYPES）；ContentBlock
-// 是 merge-extensible 联合，已知块取字段，未知块按 JSON 长度保守计价。
+// surface 上只有四类事件（dsh-session SURFACE_EVENT_TYPES：system/user/
+// assistant/tool-result）；ContentBlock 是 merge-extensible 联合，已知块
+// 取字段，未知块（如 image）不贡献文本、按 0 计——它在这条投影里本来就
+// 没有可读文本，价格由路由自己算。
 function blockText(block) {
   if (block === null || typeof block !== 'object') return ''
   if (block.type === 'text' || block.type === 'reasoning') return typeof block.text === 'string' ? block.text : ''
@@ -64,11 +83,13 @@ function blocksText(blocks) {
 function entryText(event) {
   const data = event.data || {}
   if (event.type === 'user/message') return blocksText(data.content)
+  if (event.type === 'system/message') return blocksText(data.message && data.message.content)
   if (event.type === 'assistant/message') return blocksText(data.message && data.message.content)
   if (event.type === 'tool/result') return blocksText(data.message && data.message.content)
   return ''
 }
 function entryKindOf(type) {
+  if (type === 'system/message') return 'system'
   if (type === 'user/message') return 'user'
   if (type === 'assistant/message') return 'assistant'
   if (type === 'tool/result') return 'tool'
@@ -159,73 +180,235 @@ function groupRuns(surfaceNodes, wanted) {
 }
 
 /**
- * 执行一次裁剪：每个连续段一对事件（prune 计价 + notice 替换），协议形状
- * 与官方 dsh-compaction-tool-result-pruner 一致。append 抛错即整段回滚失败
- * 信息（前段已成功的事件保留在日志里——append-only，不追求事务性）。
+ * surface node 0 若是系统提示词，宿主只允许它被另一条 `system/message` 单节点
+ * 覆写（session `assertSystemHeadRewrite`）；任何以 node 0 起头的替换都会被拒：
+ *   surface replace: node 0 holds the system prompt and may be rewritten only
+ *   by a system/message over exactly that node
+ * 剃刀一律用 user/message 标记来替换，所以系统提示词在这条协议下删不掉。
+ *
+ * 这条规则宿主只在 append 时才判，本地无法预检，因此必须在这里显式拦住——
+ * 且必须排在 append 任何事件之前，否则 prune 先落盘就留下悬空计价。
  */
-function deleteEntries(session, wantedSeqs) {
+function assertSystemHeadUntouched(session, nodes, runs) {
+  if (runs.length === 0 || runs[0][0] !== nodes[0]) return
+  const head = eventsOf(session).find((event) => event.seq === nodes[0])
+  if (head === undefined || head.type !== 'system/message') return
+  throw new Error(
+    '系统提示词（上下文第 1 条）不能删除：宿主只允许它被另一条 system/message 覆写，'
+    + '而本插件的删除是以 user/message 标记替换整段。请改选其他条目。',
+  )
+}
+
+/**
+ * 把选中 seq 扩到工具配对边界，返回实际要删的 seq 集与"多选了哪些"。
+ *
+ * 宿主把"一个 step 的 tool-call 与其 tool/result 不可拆开"当作不变式：
+ * 压缩引擎自己挑切口时会回退到平衡位置（compaction-basic 的
+ * `compactRegion`），而折叠一个没有对应 tool-call 的 tool/result 会直接
+ * 判为损坏。剃刀只按 surface 相邻分组，若用户只勾了 tool/result（本插件
+ * 最典型的用法——按工具名筛出大块工具输出），配对就被拆开了。
+ *
+ * 所以这里向两侧扩到平衡切口，并把"多删了哪些"如实回给调用方，不静默多删。
+ */
+function expandToPairBoundaries(session, wanted, nodes) {
+  const index = new Map(nodes.map((seq, i) => [seq, i]))
+  const chosen = new Set()
+  for (const seq of wanted) {
+    if (!index.has(seq)) throw new Error(`seqs not on current surface: ${seq}`)
+    chosen.add(seq)
+  }
+  const requested = new Set(chosen)
+  if (toolPairing === null) {
+    return { seqs: [...chosen].sort((a, b) => index.get(a) - index.get(b)), added: [], guard: 'unavailable' }
+  }
+  const balance = (side, seq) => {
+    try {
+      return toolPairing[side](session, seq)
+    } catch (e) {
+      // 宿主判定自身抛错 = surface 已经处在它认定为损坏的状态（多半是旧版
+      // 插件拆过配对，或别的写入方越了界）。此时不能继续删除，如实报出。
+      throw new Error(`宿主工具配对判定失败，会话 surface 可能已被损坏：${(e && e.message) || e}`)
+    }
+  }
+  // 每次把不平衡的边界向外扩一格，直到所有段都落在平衡切口上。扩进来的
+  // 节点可能与相邻段连成一段，所以每轮重新分组；判定收敛看的是"这一轮有没有
+  // 真的变大"而不是轮数，所以不会空转。surface 整体是平衡的，因此必然收敛。
+  for (let round = 0; round <= nodes.length + 1; round += 1) {
+    const sizeAtStart = chosen.size
+    for (const run of groupRuns(nodes, [...chosen])) {
+      const first = run[0]
+      const last = run[run.length - 1]
+      if (!balance('before', first)) {
+        const at = index.get(first)
+        if (at === 0) throw new Error(`工具配对：seq ${first} 之前就是不平衡切口，无法扩到平衡边界`)
+        chosen.add(nodes[at - 1])
+      }
+      if (!balance('after', last)) {
+        const at = index.get(last)
+        if (at === nodes.length - 1) throw new Error(`工具配对：seq ${last} 之后就是不平衡切口，无法扩到平衡边界`)
+        chosen.add(nodes[at + 1])
+      }
+    }
+    if (chosen.size === sizeAtStart) {
+      const seqs = [...chosen].sort((a, b) => index.get(a) - index.get(b))
+      return { seqs, added: seqs.filter((seq) => !requested.has(seq)), guard: 'host' }
+    }
+  }
+  throw new Error('工具配对：无法把选中项扩到平衡边界（surface 可能已损坏）')
+}
+
+/**
+ * prune 事件的计价来源。
+ *
+ * `shadowedTokenCount` 会被宿主的 surface 折叠（token-meter 的
+ * `foldSurfaceProjection`）直接相减，而它给每条消息定价用的是固定的启发式
+ * 估计器（chars/4 + 块/角色结构开销）。所以这个数只能是同一把尺子的结果
+ * ——喂本插件界面展示用的 cl100k 数字会让宿主的上下文压力计量每次删除都
+ * 漂移一截（同一段中文两者能差两位数）。
+ *
+ * 计量器不可用时（该行被 profile 关掉 / 尚未激活）退回 cl100k：此时也没有
+ * 任何消费方会折叠这个数（折叠就写在那个包里），退回无害；所用来源会随
+ * 响应回显，不留下"这次用的哪把尺子"的含糊。
+ */
+function pricingFor(ctx) {
+  const meter = ctx && typeof ctx.get === 'function' ? ctx.get('tokenMeter') : undefined
+  if (meter && typeof meter.estimateMessage === 'function' && deriveEventMessage !== null) {
+    return {
+      source: 'tokenMeter',
+      priceEvent(event) {
+        const message = deriveEventMessage(event)
+        return message === null ? 0 : meter.estimateMessage(message)
+      },
+    }
+  }
+  return {
+    source: 'cl100k-fallback',
+    priceEvent(event) { return countTokens(entryText(event)).tokens },
+  }
+}
+
+/**
+ * 执行一次裁剪：每个连续段一对事件（prune 计价 + notice 替换），协议形状
+ * 与官方 dsh-compaction-tool-result-pruner 一致。
+ *
+ * 顺序有讲究：所有**可能抛错**的步骤（busy 检查、seq 归属、配对扩展、计价、
+ * 标记消息构造）都排在第一条 append 之前。否则一旦替换那条被宿主拒掉，前
+ * 面已经落盘的 prune 就成了悬空的计价声明——日志 append-only，撤不回来。
+ *
+ * @param session - 目标会话。
+ * @param wantedSeqs - 用户勾选的 seq。
+ * @param pricing - 计价来源（见 `pricingFor`）；缺省退回 cl100k。
+ * @returns 实际删除条数、计价 token、每段范围，以及为保持工具配对而多删的 seq。
+ */
+function deleteEntries(session, wantedSeqs, pricing) {
   if (sessionBusy(session)) throw new Error('session is busy: wait for the running turn to finish')
   const nodes = [...session.surface.nodes]
-  const runs = groupRuns(nodes, wantedSeqs)
+  groupRuns(nodes, wantedSeqs)                       // 先做一次归属校验，错误信息保持原样
+  const expanded = expandToPairBoundaries(session, wantedSeqs, nodes)
+  const runs = groupRuns(nodes, expanded.seqs)       // 扩展后重新分段（相邻段会合并）
+  assertSystemHeadUntouched(session, nodes, runs)    // 系统提示词不可删（宿主硬规则）
   const bySeq = new Map(eventsOf(session).map((event) => [event.seq, event]))
-  const done = []
-  let removed = 0
-  let tokensRemoved = 0
-  for (const run of runs) {
+  const priceEvent = pricing && typeof pricing.priceEvent === 'function'
+    ? pricing.priceEvent
+    : (event) => countTokens(entryText(event)).tokens
+
+  // 先把每一段要落的两个事件都算好，再统一 append——见上面的顺序说明。
+  const planned = runs.map((run) => {
     const start = run[0]
     const end = run[run.length - 1]
     let runTokens = 0
     for (const seq of run) {
       const event = bySeq.get(seq)
-      if (event !== undefined) runTokens += countTokens(entryText(event)).tokens
+      if (event !== undefined) runTokens += priceEvent(event)
     }
+    return {
+      run, start, end, runTokens,
+      marker: createUserMessage({
+        content: [{ type: 'text', text: `[context-razor] 此处原有 ${run.length} 条历史消息（约 ${runTokens} token）已被用户删除以保持上下文聚焦；如后续对话需要被删部分的细节，请向用户确认。` }],
+        source: {
+          kind: 'plugin',
+          plugin: RAZOR_PLUGIN_NAME,
+          form: 'notice',
+          summary: `已删除 ${run.length} 条历史（约 ${runTokens} token）`,
+        },
+      }),
+    }
+  })
+
+  const done = []
+  let removed = 0
+  let tokensRemoved = 0
+  for (const { run, start, end, runTokens, marker } of planned) {
     session.append('compaction/prune', {
       shadowedRange: { start, end },
       shadowedSeqs: run,
       shadowedTokenCount: runTokens,
     })
-    const summary = `已删除 ${run.length} 条历史（约 ${runTokens} token）`
-    const marker = createUserMessage({
-      content: [{ type: 'text', text: `[context-razor] 此处原有 ${run.length} 条历史消息（约 ${runTokens} token）已被用户删除以保持上下文聚焦；如后续对话需要被删部分的细节，请向用户确认。` }],
-      source: { kind: 'plugin', plugin: RAZOR_PLUGIN_NAME, form: 'notice', summary },
-    })
     const replacement = session.append('user/message', marker, {
-      surfaceOp: { op: 'replace', start, end },
+      surfaceOp: { op: 'replace', startSeq: start, endSeq: end },
       sourceEventSeqs: run,
     })
     done.push({ start, end, count: run.length, tokens: runTokens, replacement: replacement.seq })
     removed += run.length
     tokensRemoved += runTokens
   }
-  return { removed, tokensRemoved, runs: done }
+  return {
+    removed,
+    tokensRemoved,
+    runs: done,
+    expanded: { seqs: expanded.added, guard: expanded.guard },
+    pricing: (pricing && pricing.source) || 'cl100k-fallback',
+  }
 }
 
-// ── 替换消息构造 ────────────────────────────────────────────────────────
-// 优先用宿主 dsh-llm 的官方 createUserMessage（id/冻结与宿主一致）。宿主把
-// 依赖装在自己 node_modules 里，从插件真实路径未必解析得到（pnpm 软链布局），
-// 故先沿 dsh 全局安装探测（skills-management 的 schemastery 同款模式），再退
-// 标准 require，最后手搓等价形状——append 侧自会做 JSON 合法性校验。
-function loadCreateUserMessage() {
+// ── 宿主包解析 ──────────────────────────────────────────────────────────
+// 宿主的依赖装在它自己的 node_modules 里，从插件真实路径未必解析得到
+// （pnpm 软链布局），故先沿 dsh 全局安装探测（skills-management 的
+// schemastery 同款模式），再退标准 require。
+function loadHostPackage(name) {
   const { createRequire } = require('node:module')
   for (const prefix of [process.env.DSH_GLOBAL_PREFIX, homedir()].filter(Boolean)) {
-    const hostCopy = join(prefix, 'lib', 'node_modules', '@deepseek-ai', 'dsh', 'node_modules', '@deepseek-ai', 'dsh-llm', 'lib', 'index.js')
+    const hostCopy = join(prefix, 'lib', 'node_modules', '@deepseek-ai', 'dsh', 'node_modules', '@deepseek-ai', name, 'lib', 'index.js')
     try {
-      const mod = createRequire(hostCopy)(hostCopy)
-      if (typeof mod.createUserMessage === 'function') return mod.createUserMessage
+      return createRequire(hostCopy)(hostCopy)
     } catch { /* 下一个来源 */ }
   }
   try {
-    const mod = require('@deepseek-ai/dsh-llm')
-    if (typeof mod.createUserMessage === 'function') return mod.createUserMessage
-  } catch { /* 手搓降级 */ }
-  return null
+    return require(`@deepseek-ai/${name}`)
+  } catch { return null }
 }
-const createUserMessage = loadCreateUserMessage() ?? ((input) => ({ ...input, id: randomUUID(), role: 'user' }))
+
+/** 替换消息构造优先用官方 createUserMessage（id/冻结与宿主一致），失败则手搓等价形状。 */
+const hostLlm = loadHostPackage('dsh-llm')
+const createUserMessage = typeof hostLlm?.createUserMessage === 'function'
+  ? hostLlm.createUserMessage
+  : (input) => ({ ...input, id: randomUUID(), role: 'user' })
+
+/** 事件 → 派生消息（宿主实现）。仅用于给 prune 计价，缺则退回 cl100k。 */
+const hostSession = loadHostPackage('dsh-session')
+const deriveEventMessage = typeof hostSession?.deriveEventMessage === 'function'
+  ? hostSession.deriveEventMessage
+  : null
+
+/**
+ * 工具配对平衡判定。用宿主自己的实现（压缩引擎 `compactRegion` 用的是同一份），
+ * 而不是本地重写一份 fold——重写就会随宿主演进漂移。
+ * 解析不到时为 null，删除路径会跳过护栏并把这个事实回显给调用方。
+ */
+const hostCompaction = loadHostPackage('dsh-compaction')
+const toolPairing = typeof hostCompaction?.toolPairingBalancedBefore === 'function'
+  && typeof hostCompaction?.toolPairingBalancedAfter === 'function'
+  ? { before: hostCompaction.toolPairingBalancedBefore, after: hostCompaction.toolPairingBalancedAfter }
+  : null
 
 module.exports = {
   name: 'context-razor',
   inject: ['sessions', 'webServer'],
-  __internals: { countTokens, entryText, groupRuns, projectContext, sessionBusy, deleteEntries, usageMemo },
+  __internals: {
+    countTokens, entryText, groupRuns, projectContext, sessionBusy, deleteEntries,
+    expandToPairBoundaries, assertSystemHeadUntouched, pricingFor, usageMemo,
+    hostGuards: { toolPairing: toolPairing !== null, deriveEventMessage: deriveEventMessage !== null },
+  },
 
   apply(ctx) {
     ctx.effect(() => ctx.webServer.register({
@@ -284,6 +467,11 @@ module.exports = {
               totalTokens,
               nodes: session.surface.nodes.length,
               entries,
+              // 计价尺子与配对护栏各用了哪一份，随响应回显，便于事后核对。
+              guards: {
+                pricing: pricingFor(ctx).source,
+                pairing: toolPairing === null ? 'unavailable' : 'host',
+              },
             })
             return
           }
@@ -323,7 +511,7 @@ module.exports = {
               fail(400, 'body must provide seqs: non-empty safe-integer array'); return
             }
             try {
-              const result = deleteEntries(session, body.seqs)
+              const result = deleteEntries(session, body.seqs, pricingFor(ctx))
               sendJson(200, result)
             } catch (e) {
               fail(409, (e && e.message) || 'delete failed')
